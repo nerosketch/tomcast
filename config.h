@@ -56,6 +56,7 @@ typedef struct {
 	int reconnect:1,		/* Set to 1 to force proxy reconnect */
 	    connected:1,		/* It's set to 1 when proxy is connected and serving clients */
 	    dienow:1,			/* Stop serving clients and exit now */
+            hibernate:1,                /* Sleep channel, while nobody used him */
 	    freechannel:1;		/* Free channel data on object free (this is used in chanconf) */
 	int cookie;				/* Used in chanconf to determine if the restreamer is alrady checked */
 	pthread_t thread;

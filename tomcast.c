@@ -34,6 +34,7 @@
 #include "config.h"
 
 #include "web_server.h"
+#include "igmp.h"
 
 #define DNS_RESOLVER_TIMEOUT 5000
 
@@ -72,6 +73,7 @@ char *server_ver = "1.30";
 char *copyright  = "Copyright (C) 2010-2016 Unix Solutions Ltd.";
 
 static struct config config;
+int igmp_sock;
 
 channel_source get_sproto(char *url) {
 	return strncmp(url, "http", 4)==0 ? tcp_sock : udp_sock;
@@ -248,6 +250,7 @@ RESTREAMER * new_restreamer(const char *name, CHANNEL *channel) {
 	r->channel = channel;
 	r->clientsock = -1;
 	r->dst_sockname = sockname;
+	r->hibernate = 0;
 	pthread_rwlock_init(&r->lock, NULL);
 	connect_destination(r);
 	return r;
@@ -267,7 +270,7 @@ char TS_NULL_FRAME[FRAME_PACKET_SIZE];
 regex_t http_response;
 
 void proxy_log(RESTREAMER *r, char *msg, char *info) {
-	LOGf("%s: %s Chan: %s Src: %s Dst: udp://%s:%d SrcIP: %s SrcFD: %i DstFD: %i\n",
+	LOGf("%s: %sChan: %s Src: %s Dst: udp://%s:%d SrcIP: %s SrcFD: %i DstFD: %i\n",
 		msg,
 		info,
 		r->channel->name,
@@ -412,7 +415,7 @@ report_error:
 }
 
 void proxy_close(RESTREAMER *r) {
-	proxy_log(r, "STOP ","-");
+	proxy_log(r, "STOP ","");
 	// If there are no clients left, no "Timeout" messages will be logged
 	list_del_entry(config.restreamer, r);
 	free_restreamer(r);
@@ -446,12 +449,8 @@ void proxy_close(RESTREAMER *r) {
 		 1 = retry
 		 0 = connected ok
 */
-int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code, char *url, int depth) {
-	CHANSRC *src = init_chansrc(url);
-	if (depth > 4) {
-		LOGf("ERR  : Redirect loop detected, depth: %d | Channel: %s Source: %s\n", depth, r->channel->name, url);
-		FATAL_ERROR;
-	}
+int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code) {
+	CHANSRC *src = init_chansrc(r->channel->source);
 	if (!src) {
 		LOGf("ERR  : Can't parse channel source | Channel: %s Source: %s\n", r->channel->name, r->channel->source);
 		FATAL_ERROR;
@@ -481,11 +480,7 @@ int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code, c
 			log_perror("play(): Could not create SOCK_STREAM socket.", errno);
 			FATAL_ERROR;
 		}
-		if (depth == 0) {
-			proxy_log(r, "NEW  ", "-");
-		} else {
-			proxy_log(r, "NEW  ", url);
-		}
+		proxy_log(r, "NEW  ","");
 		if (do_connect(r->sock, (struct sockaddr *)&(r->src_sockname), sizeof(r->src_sockname), PROXY_CONNECT_TIMEOUT) < 0) {
 			LOGf("ERR  : Error connecting to %s srv_fd: %i err: %s\n", r->channel->source, r->sock, strerror(errno));
 			proxy_set_status(r, "ERROR: Can not connect to source");
@@ -497,8 +492,6 @@ int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code, c
 		buf[sizeof(buf)-1] = 0;
 		fdwrite(r->sock, buf, strlen(buf));
 
-		char redirect_to[1024];
-		memset(redirect_to, 0, sizeof(redirect_to));
 		char xresponse[128];
 		memset(xresponse, 0, sizeof(xresponse));
 		memset(buf, 0, sizeof(buf));
@@ -525,20 +518,6 @@ int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code, c
 					break;
 				}
 			}
-			if (strstr(buf, "Location: ") == buf) {
-				// Remove new line
-				char *new_line = strchr(buf, '\r');
-				if (new_line) *new_line = '\0';
-				new_line = strchr(buf, '\n');
-				if (new_line) *new_line = '\0';
-				snprintf(redirect_to, sizeof(redirect_to)-1, "%s", buf + 10);
-				if (strstr(redirect_to, "http://") != redirect_to) {
-					// Assume that the redirect is relative, add proto, host and port
-					snprintf(redirect_to, sizeof(redirect_to)-1, "http://%s:%d%s",
-						src->host, src->port, buf + 10);
-					LOGf("DEBUG: Converted relative location to: %s | srv_fd: %i\n", redirect_to, r->sock);
-				}
-			}
 		}
 		if (*http_code == 0) { // No valid HTTP response, retry
 			LOGf("DEBUG: Server returned not valid HTTP code | srv_fd: %i\n", r->sock);
@@ -550,15 +529,7 @@ int connect_source(RESTREAMER *r, int retries, int readbuflen, int *http_code, c
 			proxy_set_status(r, "ERROR: Source returned no-signal");
 			FATAL_ERROR;
 		}
-		if (*http_code == 301 || *http_code == 302) { // Handle redirects
-			if (redirect_to[0]) {
-				LOGf("REDIR: Get code %i for %s from %s on srv_fd: %i, handling redirect to: %s\n", *http_code, r->channel->name, r->channel->source, r->sock, redirect_to);
-				free_chansrc(src);
-				shutdown_fd(&(r->sock));
-				return connect_source(r, retries, readbuflen, http_code, redirect_to, ++depth);
-			}
-			// Redirect connect is OK, continue
-		} else if (*http_code > 300) { // Unhandled or error codes, exit
+		if (*http_code > 300) { // Unhandled or error codes, exit
 			LOGf("ERR  : Get code %i for %s from %s on srv_fd: %i exiting.\n", *http_code, r->channel->name, r->channel->source, r->sock);
 			proxy_set_status(r, "ERROR: Source returned unhandled error code");
 			FATAL_ERROR;
@@ -819,7 +790,7 @@ void * proxy_ts_stream(void *self) {
 		r->conn_ts = 0;
 		r->read_bytes = 0;
 
-		int result = connect_source(self, 1, FRAME_PACKET_SIZE * 1000, &http_code, r->channel->source, 0);
+		int result = connect_source(self, 1, FRAME_PACKET_SIZE * 1000, &http_code);
 		if (result > 0)
 			goto RECONNECT;
 
@@ -833,6 +804,11 @@ void * proxy_ts_stream(void *self) {
 		int max_zero_reads = MAX_ZERO_READS;
 		int send_reset = send_reset_opt;
 		for (;;) {
+			if(r->hibernate){
+				//usleep(10000);
+				sleep(1);
+				continue;
+			}
 			switch (check_restreamer_state(r)) {
 				case 1: goto RECONNECT;		// r->reconnect is on
 				case 2: goto QUIT;			// r->dienow is on
@@ -936,7 +912,6 @@ void set_ident(char *new_ident, struct config *cfg) {
 void parse_options(int argc, char **argv, struct config *cfg) {
 	int j, ttl;
 	cfg->server_socket = -1;
-	cfg->logport = 514;
 	pthread_mutex_init(&cfg->channels_lock, NULL);
 	while ((j = getopt(argc, argv, "i:b:p:c:d:t:o:l:L:RHh")) != -1) {
 		switch (j) {
@@ -1085,6 +1060,7 @@ int keep_going = 1;
 
 void signal_quit(int sig) {
 	keep_going = 0;
+	close(igmp_sock);
 	kill_proxy_threads(&config);
 	usleep(500000);
 	LOGf("KILL : Signal %i | %s %s (%s)\n", sig, server_sig, server_ver, config.ident);
@@ -1155,6 +1131,56 @@ void init_logger(struct config *cfg) {
 	log_init(cfg->logident, cfg->syslog_active, cfg->pidfile == NULL, cfg->loghost, cfg->logport);
 }
 
+
+void set_hibernate(int k, uint32_t channel){
+
+	LNODE *lr, *lrtmp;
+	list_lock(config.restreamer);
+	list_for_each(config.restreamer, lr, lrtmp)
+	{
+		RESTREAMER *r = lr->data;
+
+		if(r->dst_sockname.sin_addr.s_addr == channel)
+		{
+			r->hibernate = k;
+			break;
+		}
+
+	}
+	list_unlock(config.restreamer);
+}
+
+
+int on_igmp_report(struct ip *p_ip_hdr, struct igmp *p_igmp){
+
+	if(p_igmp->igmp_type == IGMP_V2_MEMBERSHIP_REPORT){
+		printf("\tIGMP MEMBERSHIP_REPORT: dst: %s igmp_type: %hhu\n",
+			inet_ntoa(p_ip_hdr->ip_dst),
+			p_igmp->igmp_type);
+		set_hibernate(0, p_ip_hdr->ip_dst.s_addr);
+	}
+
+	else if(p_igmp->igmp_type == IGMP_V2_LEAVE_GROUP){
+		printf("\tIGMP MEMBERSHIP_LEAVE_REPORT: dst: %s igmp_type: %hhu\n",
+			inet_ntoa(p_ip_hdr->ip_dst),
+			p_igmp->igmp_type);
+		set_hibernate(1, p_ip_hdr->ip_dst.s_addr);
+	}
+
+	else if(p_igmp->igmp_type == IGMP_MEMBERSHIP_QUERY){
+		printf("\tIGMP MEMBERSHIP_QUERY: dst: %s igmp_type: %hhu\n",
+			inet_ntoa(p_ip_hdr->ip_dst),
+			p_igmp->igmp_type);
+		set_hibernate(0, p_ip_hdr->ip_dst.s_addr);
+	}
+
+	else
+		printf("\tIGMP not known packet, type=%hhu\n", p_igmp->igmp_type);
+
+	return 0;
+}
+
+
 int main(int argc, char **argv) {
 	set_http_response_server_ident(server_sig, server_ver);
 	show_usage(1); // Show copyright and version
@@ -1170,9 +1196,15 @@ int main(int argc, char **argv) {
 	spawn_proxy_threads(&config);
 	web_server_start(&config);
 
-	do {
-		sleep(60);
-	} while(1);
+	igmp_sock = connect_igmp_src();
+	if(igmp_sock < 0){
+		signal_quit(15);
+		LOGf("Err while create igmp socket %d\n", igmp_sock);
+		exit(igmp_sock);
+	}
+	if(igmp_rcv(igmp_sock, on_igmp_report) < 0){
+		LOGf("Err while recive igmp, code: %d\n", igmp_sock);
+	}
 
 	signal_quit(15);
 	exit(0);
